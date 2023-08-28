@@ -1,0 +1,67 @@
+infra_lock_file: /tmp/infmgr.lock
+
+# Proxmox API details
+host: runner33.build.iot.jethome.ru
+# port: 8006
+#user: api@pve
+user: root@pam
+password: PA$$W0RD
+
+
+cluster:
+  runner3:
+    host: runner3.XXXX
+    port: 8006
+    basicvm: 9000
+
+domain: XXXX
+
+
+# Use a token instead of a password for authentication
+# token_name: name
+# token_secret: 000-000-...
+#token_name: garm
+#token_secret: 31177818-2748-4a9d-a0a5-8fe46374b801
+#token_secret: efe29e35-700f-4bed-bd0f-80649508424c
+
+# Current = Determine load based on current resource usage
+# Max = Determine load based on maximum assigned resource
+method: max
+#current
+
+# Maximum allowed imbalance over the cluster, measured in points.
+# Decrease this to move VMs more often, increase for larger clusters.
+allowed_disparity: 20
+
+# Run multiple migration tasks asynchronously?
+async: true
+
+# Balancer rules.
+#rules:
+#  separate:
+#    - myvm1,myvm2,myvm3
+#  unite:
+#    - myclingyvm1,myclingyvm2
+#  pin:
+#    - myvm4:pvenode1
+#    - myvm5:pvenode2
+vmconfig:
+  standard:
+    mem: 12288
+    cores: 4
+    storage: 100G
+  small:
+    mem: 8192
+    cores: 2
+    storage: 50G
+  tiny:
+    mem: 4096
+    cores: 1
+    storage: 20G
+  large:
+    mem: 24576
+    cores: 8
+    storage: 200G
+
+basicvm:
+  runner3: 9000
