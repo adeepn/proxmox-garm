@@ -1,5 +1,15 @@
+import operator
 import os
+import re
+import sys
+import time
+
 from proxmoxer import ProxmoxAPI
+import locket
+import argparse
+import yaml
+import requests
+
 
 class ProxmoxBalancer:
     vm_list = []
@@ -9,13 +19,8 @@ class ProxmoxBalancer:
     proxmox = False
 
     def __init__(self):
-        # Read args from env vars
-        self.GARM_COMMAND = os.getenv('GARM_COMMAND')
-        self.GARM_PROVIDER_CONFIG_FILE = os.getenv('GARM_PROVIDER_CONFIG_FILE')
-        self.GARM_CONTROLLER_ID = os.getenv('GARM_CONTROLLER_ID')
-        self.GARM_POOL_ID = os.getenv('GARM_POOL_ID')
-        self.GARM_INSTANCE_ID = os.getenv('GARM_INSTANCE_ID')
-
+        import urllib3
+        urllib3.disable_warnings()
         # Read config
         parser = argparse.ArgumentParser()
         parser.add_argument("-d", "--dry", action="store_true")
@@ -26,6 +31,7 @@ class ProxmoxBalancer:
         )
         args = parser.parse_args()
         self.dry = args.dry
+        # self.dry = True
 
         if not os.path.exists(args.config):
             sys.stderr.write("Cannot find config file\n")
@@ -52,26 +58,156 @@ class ProxmoxBalancer:
                 sys.exit(1)
 
         self.config = config
-
-        if "token_name" in config and "token_secret" in config:
-            self.proxmox = ProxmoxAPI(
-                    config["host"],
-                    port=config["port"],
-                    user=config["user"],
-                    token_name=config["token_name"],
-                    token_value=config["token_secret"],
-                    backend="https",
-                    verify_ssl=False,
-                    )
+        ConnectOk=None
+        if "cluster" in config:
+            for dhost in self.config["cluster"]:
+                chost = self.config["cluster"][dhost]
+                print ("chost: %s"%(self.config["cluster"][dhost]))
+                try:
+                    if "port" not in chost:
+                        chost["port"] = 8006
+                    if "token_name" in config and "token_secret" in config:
+                        self.proxmox = ProxmoxAPI(
+                            chost["host"],
+                            port=chost["port"],
+                            user=config["user"],
+                            token_name=config["token_name"],
+                            token_value=config["token_secret"],
+                            backend="https",
+                            verify_ssl=False,
+                        )
+                    else:
+                        self.proxmox = ProxmoxAPI(
+                            chost["host"],
+                            port=chost["port"],
+                            user=config["user"],
+                            password=config["password"],
+                            backend="https",
+                            verify_ssl=False,
+                        )
+                    ConnectOk = True
+                except:
+                    pass
         else:
-            self.proxmox = ProxmoxAPI(
-                    config["host"],
-                    port=config["port"],
-                    user=config["user"],
-                    password=config["password"],
-                    backend="https",
-                    verify_ssl=False,
+            try:
+                if "token_name" in config and "token_secret" in config:
+                    self.proxmox = ProxmoxAPI(
+                        config["host"],
+                        port=config["port"],
+                        user=config["user"],
+                        token_name=config["token_name"],
+                        token_value=config["token_secret"],
+                        backend="https",
+                        verify_ssl=False,
                     )
+                else:
+                    self.proxmox = ProxmoxAPI(
+                        config["host"],
+                        port=config["port"],
+                        user=config["user"],
+                        password=config["password"],
+                        backend="https",
+                        verify_ssl=False,
+                    )
+                ConnectOk = True
+            except:
+                pass
+        if not ConnectOk:
+            print("Can't connect to proxmox")
+            exit(10)
+    # Clone basic vm runner to new VM
+    def run_vm(self, type, tags, wait=True):
+        node = self.get_free_node()
+        if type not in self.config['vmconfig']:
+            print("Unknown vm type %s" % (type,))
+            return -1
+        mem = self.config['vmconfig'][type]['mem']
+        cores = self.config['vmconfig'][type]['cores']
+        storage = self.config['vmconfig'][type]['storage']
+        vmid = self.proxmox.cluster.nextid.get()
+        basicvm = self.config['basicvm'][node]
+        if "name" not in tags:
+            tags = {}
+            tags["name"] = "testrun"
+        data = {
+            "newid": vmid,
+            "full": 0,
+            "name": tags["name"] + "%s" % (vmid),
+            "target": node,
+        }
+        if not self.dry:
+            print("Would start new node %s on %s" % (type, node))
+            print("VM: %s %s %s" % (mem, cores, storage))
+            print("Free VMID: %s basicvm: %s" % (vmid, basicvm))
+            taskid = self.proxmox.nodes(node).qemu(basicvm).clone.post(**data)
+            print("Task clone id: %s" % (taskid))
+            if wait:
+                self.wait_for_task(node, taskid)
+            data = {
+                "cores": cores,
+                "sockets": 1,
+                "memory": mem,
+                "hookscript": "local:snippets/auto-delete.sh"
+            }
+            taskid = self.proxmox.nodes(node).qemu(vmid).config.post(**data)
+            print("Task config id: %s" % taskid)
+            if wait:
+                self.wait_for_task(node, taskid)
+            data = {
+                "disk": "scsi0",
+                "size": storage,
+            }
+            taskid = self.proxmox.nodes(node).qemu(vmid).resize.put(**data)
+            print("Task resize id: %s %s" % (taskid, data))
+            if wait:
+                self.wait_for_task(node, taskid)
+            taskid = self.proxmox.nodes(node).qemu(vmid).cloudinit.put()
+            print("Task cloudinit id: %s %s" % (taskid, data))
+            if wait:
+                self.wait_for_task(node, taskid)
+
+            taskid = self.proxmox.nodes(node).qemu(vmid).status.start.post()
+            print("Task run id: %s" % taskid)
+            if wait:
+                self.wait_for_task(node, taskid)
+            netconfig = self.proxmox.nodes(node).qemu(vmid).config.get()
+            p = re.compile(r'([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})')
+            mac = re.findall(p, u"%s" % netconfig)
+            print("Netconfig: %s" % mac[0])
+            loopvar = True
+            while loopvar:
+                try:
+                    taskid = self.proxmox.nodes(node).qemu(vmid).agent.get("info")
+                    loopvar = False
+                except:
+                    print("Waiting for vm to start")
+                    time.sleep(5)
+
+            data = {
+                "content": "test token\n",
+                "file": "/etc/garm-token",
+            }
+            taskid = self.proxmox.nodes(node).qemu(vmid).agent.post("file-write", **data)
+            if wait:
+                self.wait_for_task(node, taskid)
+        else:
+            print("DRY: Would start new node %s on %s" % (type, node))
+            print("VM: %s %s %s" % (mem, cores, storage))
+            print("Free VMID: %s" % (vmid))
+
+    def get_free_node(self):
+        with locket.lock_file(self.config["infra_lock_file"], timeout=120):
+            # First get the current list of hosts and VMs.
+            self.regenerate_lists()
+            minnode = None
+            for node in self.node_list:
+                if not minnode:
+                    minnode = node
+                else:
+                    if self.node_list[node]["points"] - self.node_list[node]["used_points"] > self.node_list[minnode][
+                        "points"] - self.node_list[minnode]["used_points"]:
+                        minnode = node
+        return minnode
 
     # Get various useful sum.
     def get_totals(self):
@@ -153,7 +289,7 @@ class ProxmoxBalancer:
             # This is not particularly forward-thinking but it will do for now.
             new_points = self.node_list[node_name]["used_points"] + points
             if new_points < self.node_list[current_node]["used_points"] and (
-                new_points < new_host_points or new_host_points == 0
+                    new_points < new_host_points or new_host_points == 0
             ):
                 new_host = node_name
                 new_host_points = new_points
@@ -259,14 +395,14 @@ class ProxmoxBalancer:
 
                 # Deal with unite rules.
                 if rule["type"] == "unite" and self.should_unite(
-                    rule["rule"], vm_name, self.node_list[node_name]["vms"]
+                        rule["rule"], vm_name, self.node_list[node_name]["vms"]
                 ):
                     print("Rule violation detected for '%s': Unite violation" % vm_name)
                     target = self.unite(rule["rule"], vm_name)
 
                 # Deal with separation rules.
                 if rule["type"] == "separate" and self.should_separate(
-                    rule["rule"], vm_name, self.node_list[node_name]["vms"]
+                        rule["rule"], vm_name, self.node_list[node_name]["vms"]
                 ):
                     print(
                         "Rule violation detected for '%s': Separation violation"
@@ -368,7 +504,7 @@ class ProxmoxBalancer:
     # Each CPU core is worth 5 points, each GB ram is 1 point.
     def calculate_vm_points(self, vm):
         if self.config["method"] == "max":
-            return (vm["maxcpu"] * 5) + ((vm["maxmem"] / 1024 / 1024 / 1024) * 1)
+            return (vm["cpu"] * 5) + ((vm["maxmem"] / 1024 / 1024 / 1024) * 1)
         return (vm["cpu"] * 5) + ((vm["mem"] / 1024 / 1024 / 1024) * 1)
 
     # Generate node_list and vm_list.
@@ -380,6 +516,7 @@ class ProxmoxBalancer:
             self.node_list[node_name]["vms"] = {}
 
             # Calculate points.
+            # print(node)
             points = (node["maxcpu"] * 5) + ((node["maxmem"] / 1024 / 1024 / 1024) * 1)
             self.node_list[node_name]["points"] = points
             self.node_list[node_name]["used_points"] = 0
@@ -398,6 +535,9 @@ class ProxmoxBalancer:
                             "points": points,
                         }
                     )
+            print("!!! Node: %s maxpoint: %s free points: %s" % (node_name, self.node_list[node_name]["points"],
+                                                                 self.node_list[node_name]["points"] -
+                                                                 self.node_list[node_name]["used_points"]))
 
         # Order vm_list.
         self.vm_list.sort(key=operator.itemgetter("points"))
@@ -421,7 +561,7 @@ class ProxmoxBalancer:
             # Okay, work out the imbalance here and run migrations.
             total_disparity = self.calculate_imbalance()
             if total_disparity > (
-                len(self.node_list) * self.config["allowed_disparity"]
+                    len(self.node_list) * self.config["allowed_disparity"]
             ):
                 print("Running balance%s..." % (" (dry mode)" if self.dry else ""))
 
